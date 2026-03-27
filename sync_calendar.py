@@ -8,6 +8,14 @@ import time
 from typing import List, Dict, Optional
 from icalendar import Calendar
 
+# 尝试从 .env 文件加载环境变量
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # 加载 .env 文件
+except ImportError:
+    # 如果没安装 python-dotenv 就跳过，直接使用系统环境变量
+    pass
+
 # 配置信息 - 从环境变量读取
 API_BASE = os.getenv("API_BASE", "https://cloud.zectrix.com/open/v1")
 API_KEY = os.getenv("API_KEY", "")
@@ -15,7 +23,7 @@ DEVICE_ID = os.getenv("DEVICE_ID", "")
 EXPIRE_HOURS = int(os.getenv("EXPIRE_HOURS", "1"))  # 超过N小时删除
 
 # CalDAV配置 - 从环境变量读取
-CALDAV_URL = os.getenv("CALDAV_URL", "https://caldav.mxhichina.com/dav/your-email@example.com/")
+CALDAV_URL = os.getenv("CALDAV_URL", "https://caldav.mxhichina.com/dav/")
 CALDAV_USER = os.getenv("CALDAV_USER", "")  # 你的CalDAV用户名
 CALDAV_PASS = os.getenv("CALDAV_PASS", "")  # 你的CalDAV密码/授权码
 
@@ -152,42 +160,60 @@ class CalendarSyncer:
 
         def _fetch():
             import caldav
+            import requests
 
-            # 连接CalDAV服务器 (兼容老版本API)
+            # 连接CalDAV服务器
             client = caldav.DAVClient(
                 url=CALDAV_URL,
                 username=CALDAV_USER,
-                password=CALDAV_PASS,
-                auth=requests.auth.HTTPBasicAuth(CALDAV_USER, CALDAV_PASS)
+                password=CALDAV_PASS
             )
 
-            # 获取所有日历
-            principal = client.principal()
-            calendars = principal.calendars()
-            if not calendars:
-                print("未找到日历")
-                return []
+            try:
+                # 获取所有日历
+                principal = client.principal()
+                calendars = principal.calendars()
 
-            print(f"找到 {len(calendars)} 个日历")
+                if not calendars:
+                    print("未找到日历")
+                    return []
 
-            # 在每个日历中搜索接下来24小时内的事件
-            events = []
-            now = datetime.datetime.now().astimezone()
-            # 搜索范围从现在开始到未来24小时
-            start_search = now - datetime.timedelta(minutes=10)  # 给点缓冲
-            end_search = now + datetime.timedelta(hours=24)
+                print(f"找到 {len(calendars)} 个日历")
 
-            for calendar in calendars:
-                events_found = calendar.search(
-                    start=start_search,
-                    end=end_search
-                )
-                for event in events_found:
-                    parsed_list = self.parse_caldav_event(event)
-                    events.extend(parsed_list)
+                # 在每个日历中搜索接下来24小时内的事件
+                events = []
+                now = datetime.datetime.now().astimezone()
+                # 搜索范围从现在开始到未来24小时
+                start_search = now - datetime.timedelta(minutes=10)  # 给点缓冲
+                end_search = now + datetime.timedelta(hours=24)
 
-            print(f"解析出 {len(events)} 个未来24小时内的日程")
-            return events
+                for calendar in calendars:
+                    print(f"  搜索日历: {calendar.url}")
+                    events_found = calendar.date_search(
+                        start=start_search,
+                        end=end_search
+                    )
+                    for event in events_found:
+                        parsed_list = self.parse_caldav_event(event)
+                        events.extend(parsed_list)
+
+                print(f"解析出 {len(events)} 个未来24小时内的日程")
+                return events
+            except Exception as e:
+                # 尝试提取更多错误信息
+                import inspect
+                print(f"  CalDAV错误: {type(e).__name__}: {e}")
+                # 尝试获取response对象
+                if 'reason' in inspect.signature(e.__init__).parameters:
+                    # caldav AuthorizationError 结构: (url, reason)
+                    args = e.args
+                    if len(args) >= 2:
+                        print(f"  URL: {args[0]}")
+                        print(f"  Reason: {args[1]}")
+                if hasattr(e, 'response') and e.response is not None:
+                    print(f"  状态码: {e.response.status_code}")
+                    print(f"  响应内容: {e.response.text}")
+                raise
 
         result = self.retry_with_backoff(_fetch)
         return result if result is not None else []
