@@ -5,7 +5,7 @@ import datetime
 import json
 import sys
 import time
-from typing import List, Dict
+from typing import List, Dict, Optional
 from icalendar import Calendar
 
 # 配置信息 - 从环境变量读取
@@ -81,10 +81,16 @@ class CalendarSyncer:
             print(f"解析时间出错 {dueDate} {dueTime}: {e}")
             return False
 
-    def delete_expired_calendar_todos(self):
-        """删除过期的日历待办"""
-        deleted_count = 0
+    def complete_expired_calendar_todos(self):
+        """将过期的日历待办标记为完成"""
+        completed_count = 0
         for todo in self.existing_todos:
+            # 只处理未完成的日程 (API获取时已经只请求了status=0，这里再次确认)
+            status = todo.get("status", 1)
+            if status != 0:
+                print(f"  跳过已完成日程: id={todo.get('id')} status={status}")
+                continue
+
             title = todo.get("title", "")
             if not title.startswith("[日历]"):
                 continue
@@ -94,11 +100,29 @@ class CalendarSyncer:
 
             if self.is_expired(dueDate, dueTime):
                 todo_id = todo.get("id")
-                if self.delete_todo(todo_id):
-                    print(f"已删除过期日程: id={todo_id} title={title} {dueDate} {dueTime}")
-                    deleted_count += 1
+                print(f"  发现过期日程，正在标记为完成: id={todo_id} title={title} {dueDate} {dueTime}")
+                if self.complete_todo(todo_id):
+                    print(f"  ✓ 已标记过期日程为完成: id={todo_id} title={title} {dueDate} {dueTime}")
+                    completed_count += 1
+            else:
+                print(f"  日程未过期，跳过: id={todo.get('id')} title={title} {dueDate} {dueTime}")
 
-        print(f"清理完成，共删除 {deleted_count} 个过期日程")
+        print(f"清理完成，共标记 {completed_count} 个过期日程为完成")
+
+    def complete_todo(self, todo_id: int) -> bool:
+        """标记待办为完成，带重试"""
+        def _complete():
+            url = f"{API_BASE}/todos/{todo_id}/complete"
+            resp = requests.put(url, headers=self.headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                print(f"  标记待办 {todo_id} 完成失败: {data.get('msg')}")
+                return False
+            return True
+
+        result = self.retry_with_backoff(_complete)
+        return result if result is not None else False
 
     def delete_todo(self, todo_id: int) -> bool:
         """删除单个待办，带重试"""
@@ -154,7 +178,7 @@ class CalendarSyncer:
             end_search = now + datetime.timedelta(hours=24)
 
             for calendar in calendars:
-                events_found = calendar.date_search(
+                events_found = calendar.search(
                     start=start_search,
                     end=end_search
                 )
@@ -181,6 +205,7 @@ class CalendarSyncer:
                 if component.name == "VEVENT":
                     summary = str(component.get('SUMMARY', ''))
                     dtstart = component.get('DTSTART')
+                    uid = str(component.get('UID', ''))
 
                     if not summary or not dtstart:
                         continue
@@ -218,6 +243,7 @@ class CalendarSyncer:
                         continue
 
                     events.append({
+                        "uid": uid,
                         "title": summary.strip(),
                         "dueDate": date_str,
                         "dueTime": time_str
@@ -228,13 +254,16 @@ class CalendarSyncer:
             print(f"解析CalDAV事件异常: {e}")
             return []
 
-    def create_todo(self, title: str, dueDate: str, dueTime: str) -> bool:
+    def create_todo(self, uid: str, title: str, dueDate: str, dueTime: str) -> bool:
         """创建新的待办事项，带重试"""
         def _create():
+            description = "从邮箱日历同步"
+            if uid:
+                description += f"\nUID: {uid}"
             url = f"{API_BASE}/todos"
             data = {
                 "title": f"[日历] {title}".strip(),
-                "description": "从邮箱日历同步",
+                "description": description,
                 "dueDate": dueDate,
                 "dueTime": dueTime,
                 "repeatType": "none",
@@ -254,27 +283,109 @@ class CalendarSyncer:
         result = self.retry_with_backoff(_create)
         return result if result is not None else False
 
-    def event_exists(self, event: Dict) -> bool:
-        """检查日程是否已存在 (根据title和dueDate匹配)"""
-        event_title = event["title"].strip()
-        event_date = event["dueDate"]
+    def extract_uid_from_description(self, description: str) -> str:
+        """从description中提取UID"""
+        if not description:
+            return ""
+        for line in description.split('\n'):
+            line = line.strip()
+            if line.startswith('UID:'):
+                return line[4:].strip()
+        return ""
 
+    def find_existing_todo_by_uid(self, uid: str) -> Optional[Dict]:
+        """根据UID查找现有待办"""
         for todo in self.existing_todos:
-            todo_title = todo.get("title", "").replace("[日历]", "").strip()
-            todo_date = todo.get("dueDate", "")
+            todo_desc = todo.get("description", "")
+            todo_uid = self.extract_uid_from_description(todo_desc)
+            if uid == todo_uid:
+                return todo
+        return None
 
-            if todo_title == event_title and todo_date == event_date:
+    def update_todo(self, todo_id: int, uid: str, title: str, dueDate: str, dueTime: str) -> bool:
+        """更新现有待办事项，带重试"""
+        def _update():
+            description = "从邮箱日历同步"
+            if uid:
+                description += f"\nUID: {uid}"
+            url = f"{API_BASE}/todos/{todo_id}"
+            data = {
+                "title": f"[日历] {title}".strip(),
+                "description": description,
+                "dueDate": dueDate,
+                "dueTime": dueTime
+            }
+            resp = requests.put(url, headers=self.headers, json=data, timeout=10)
+            resp.raise_for_status()
+            result = resp.json()
+            if result.get("code") == 0:
+                print(f"更新日程成功: id={todo_id} title={title} {dueDate} {dueTime}")
                 return True
-        return False
+            else:
+                print(f"更新日程失败: {result.get('msg')}")
+                return False
+
+        result = self.retry_with_backoff(_update)
+        return result if result is not None else False
 
     def sync_new_events(self, events: List[Dict]):
-        """同步不存在的新日程"""
+        """同步日程：创建新日程、更新已变更、清理已删除"""
         created_count = 0
+        updated_count = 0
+        # 收集当前所有有效日程的UID集合
+        current_uids = {event["uid"] for event in events if event.get("uid")}
+
+        # 第一步：同步新建/更新
         for event in events:
-            if not self.event_exists(event):
-                if self.create_todo(event["title"], event["dueDate"], event["dueTime"]):
+            uid = event.get("uid", "")
+            if not uid:
+                continue
+
+            existing = self.find_existing_todo_by_uid(uid)
+            if not existing:
+                # 新建
+                if self.create_todo(uid, event["title"], event["dueDate"], event["dueTime"]):
                     created_count += 1
-        print(f"同步完成，新增 {created_count} 个日程")
+            else:
+                # 检查标题或时间是否变更
+                existing_title = existing.get("title", "").replace("[日历]", "").strip()
+                existing_dueDate = existing.get("dueDate", "")
+                existing_dueTime = existing.get("dueTime", "")
+
+                if (existing_title != event["title"] or
+                    existing_dueDate != event["dueDate"] or
+                    existing_dueTime != event["dueTime"]):
+                    # 有变更，更新
+                    if self.update_todo(
+                        existing["id"], uid,
+                        event["title"], event["dueDate"], event["dueTime"]
+                    ):
+                        updated_count += 1
+
+        # 第二步：清理已在CalDAV中删除/取消的日程
+        cleaned_count = 0
+        for todo in self.existing_todos:
+            # 只处理未完成的[日历]日程
+            status = todo.get("status", 1)
+            if status != 0:
+                continue
+
+            title = todo.get("title", "")
+            if not title.startswith("[日历]"):
+                continue
+
+            # 提取UID
+            description = todo.get("description", "")
+            uid = self.extract_uid_from_description(description)
+
+            # 如果有UID但不在当前列表中，说明已被删除/取消，删除该日程
+            if uid and uid not in current_uids:
+                todo_id = todo.get("id")
+                if self.delete_todo(todo_id):
+                    print(f"已删除已取消/删除日程: id={todo_id} title={title} uid={uid}")
+                    cleaned_count += 1
+
+        print(f"同步完成，新增 {created_count}，更新 {updated_count}，删除 {cleaned_count} 个日程")
 
     def run(self):
         """运行完整同步流程"""
@@ -285,9 +396,9 @@ class CalendarSyncer:
         # 1. 获取现有待办
         self.get_existing_todos()
 
-        # 2. 删除过期的日历待办
-        print("\n步骤1: 删除过期日程...")
-        self.delete_expired_calendar_todos()
+        # 2. 将过期的日历待办标记为完成
+        print("\n步骤1: 标记过期日程为完成...")
+        self.complete_expired_calendar_todos()
 
         # 3. 获取邮箱日程
         print("\n步骤2: 获取邮箱日程...")
