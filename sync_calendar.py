@@ -184,26 +184,26 @@ class CalendarSyncer:
 
                 print(f"找到 {len(calendars)} 个日历")
 
-                # 在每个日历中搜索接下来24小时内的事件
+                # 在每个日历中搜索今天剩余的事件
                 events = []
                 now = datetime.datetime.now().astimezone()
-                # 搜索范围从现在开始到未来24小时
+                # 搜索范围：现在到今天结束（明天00:00）
                 start_search = now - datetime.timedelta(minutes=10)  # 给点缓冲
-                end_search = now + datetime.timedelta(hours=24)
+                today_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
 
                 for calendar in calendars:
                     print(f"  搜索日历: {calendar.url}")
-                    print(f"  搜索时间范围: {start_search.strftime('%Y-%m-%d %H:%M')} ~ {end_search.strftime('%Y-%m-%d %H:%M')}")
+                    print(f"  搜索时间范围: {start_search.strftime('%Y-%m-%d %H:%M')} ~ {today_end.strftime('%Y-%m-%d %H:%M')}")
                     events_found = calendar.date_search(
                         start=start_search,
-                        end=end_search
+                        end=today_end
                     )
                     print(f"  CalDAV返回 {len(events_found)} 个事件")
                     for event in events_found:
                         parsed_list = self.parse_caldav_event(event)
                         events.extend(parsed_list)
 
-                print(f"解析出 {len(events)} 个未来24小时内的日程")
+                print(f"解析出 {len(events)} 个今天剩余的日程")
                 return events
             except Exception as e:
                 print(f"  CalDAV错误: {type(e).__name__}: {e}")
@@ -216,13 +216,13 @@ class CalendarSyncer:
         return result if result is not None else []
 
     def parse_caldav_event(self, event) -> List[Dict]:
-        """解析CalDAV事件，处理时区转换，只返回未来24小时内的未取消日程"""
+        """解析CalDAV事件，处理时区转换，只返回今天剩余时间内的未取消日程"""
         events = []
         try:
             cal = Calendar.from_ical(event.data)
             now = datetime.datetime.now().astimezone()  # 当前本地时间带时区
-            # 只同步未来24小时内的日程
-            end_range = now + datetime.timedelta(hours=24)
+            # 只同步今天剩余时间的日程
+            today_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
 
             for component in cal.walk():
                 if component.name == "VEVENT":
@@ -253,12 +253,12 @@ class CalendarSyncer:
                     else:
                         continue
 
-                    # 只保留未来24小时内的日程
-                    if dt < now or dt > end_range:
+                    # 只保留今天剩余时间的日程
+                    if dt < now or dt > today_end:
                         if dt < now:
                             print(f"跳过已过去日程: {summary.strip()} {date_str} {time_str}")
                         else:
-                            print(f"跳过超过24小时日程: {summary.strip()} {date_str} {time_str}")
+                            print(f"跳过非今天日程: {summary.strip()} {date_str} {time_str}")
                         continue
 
                     events.append({
