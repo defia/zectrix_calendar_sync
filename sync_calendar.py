@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import argparse
 import requests
 import datetime
 import json
@@ -32,7 +33,8 @@ CALENDAR_PREFIX = "[日历]"
 
 
 class CalendarSyncer:
-    def __init__(self):
+    def __init__(self, dry_run=False):
+        self.dry_run = dry_run
         self.headers = {
             "X-API-Key": API_KEY,
             "Content-Type": "application/json"
@@ -128,6 +130,10 @@ class CalendarSyncer:
 
     def complete_todo(self, todo_id: int) -> bool:
         """标记待办为完成，带重试"""
+        if self.dry_run:
+            print(f"  [DRY RUN] 会标记待办为完成: id={todo_id}")
+            return True
+
         def _complete():
             url = f"{API_BASE}/todos/{todo_id}/complete"
             resp = requests.put(url, headers=self.headers, timeout=10)
@@ -143,6 +149,10 @@ class CalendarSyncer:
 
     def delete_todo(self, todo_id: int) -> bool:
         """删除单个待办，带重试"""
+        if self.dry_run:
+            print(f"  [DRY RUN] 会删除待办: id={todo_id}")
+            return True
+
         def _delete():
             url = f"{API_BASE}/todos/{todo_id}"
             resp = requests.delete(url, headers=self.headers, timeout=10)
@@ -282,6 +292,10 @@ class CalendarSyncer:
 
     def create_todo(self, uid: str, title: str, dueDate: str, dueTime: str) -> bool:
         """创建新的待办事项，带重试"""
+        if self.dry_run:
+            print(f"  [DRY RUN] 会创建日程: {CALENDAR_PREFIX} {title} {dueDate} {dueTime}")
+            return True
+
         def _create():
             data = {
                 "title": f"{CALENDAR_PREFIX} {title}".strip(),
@@ -319,6 +333,10 @@ class CalendarSyncer:
 
     def update_todo(self, todo_id: int, uid: str, title: str, dueDate: str, dueTime: str) -> bool:
         """更新现有待办事项，带重试"""
+        if self.dry_run:
+            print(f"  [DRY RUN] 会更新日程: id={todo_id} title={title} {dueDate} {dueTime}")
+            return True
+
         def _update():
             data = {
                 "title": f"{CALENDAR_PREFIX} {title}".strip(),
@@ -412,5 +430,12 @@ class CalendarSyncer:
 
 
 if __name__ == "__main__":
-    syncer = CalendarSyncer()
+    parser = argparse.ArgumentParser(description="同步邮箱日历到Zectrix待办事项")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="模拟运行，不实际执行写入操作")
+    args = parser.parse_args()
+
+    syncer = CalendarSyncer(dry_run=args.dry_run)
+    if args.dry_run:
+        print("***** DRY RUN 模式 - 不会执行任何写入操作 *****")
     syncer.run()
