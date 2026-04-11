@@ -2,7 +2,7 @@
 
 自动将邮箱 CalDAV日历同步到 Zectrix 极趣墨水屏电子便利贴。
 
-https://space.bilibili.com/13131424?spm_id_from=333.788.upinfo.detail.click
+https://space.bilibili.com/13131424
 
 https://cloud.zectrix.com/
 
@@ -11,7 +11,7 @@ https://cloud.zectrix.com/
 - 🧹 **自动标记过期日程完成**: 已超过设定时间的 `[日历]` 日程自动标记为完成
 - 📅 **同步当天日程**: 只同步今天剩余时间的日程，保持屏幕整洁
 - 🚫 **过滤已取消**: 自动跳过标题包含"已取消"、"cancelled"的会议
-- 🔄 **完整双向同步**: CalDAV 中**新建/更新/删除**都会自动同步到 Zectrix
+- 🔄 **完整双向同步**: CalDAV 中**新建/更新/删除**都会自动同步到 Zectrix，Zectrix同步到CalDAV
 - 🎯 **精确匹配**: 使用 CalDAV 原生 UID 唯一标识精确识别每个日程
 - 🔁 **自动重试**: 网络请求失败自动重试（最多3次，指数退避）
 
