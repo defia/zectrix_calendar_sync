@@ -467,7 +467,7 @@ class CalendarSyncer:
                 yield todo
 
     def create_caldav_event(self, title: str, due_date: str, due_time: str) -> Optional[str]:
-        """在 CalDAV 日历中创建事件，返回 UID"""
+        """在 CalDAV 日历中创建事件，返回 UID。due_time 为 None 时创建全天事件。"""
         if self.dry_run:
             print(f"  [DRY RUN] 会在日历创建事件: {title} {due_date} {due_time}")
             return f"dry-run-{uuid.uuid4()}"
@@ -481,12 +481,16 @@ class CalendarSyncer:
             # 生成唯一 UID
             uid = f"{uuid.uuid4()}@zectrix-sync"
 
-            # 构建 iCalendar 内容
-            dt_str = f"{due_date}T{due_time}:00"
-            dt = datetime.datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+            # 构建日期对象（用于全天事件）
+            dt_date = datetime.datetime.strptime(due_date, "%Y-%m-%d").date()
+            next_date = dt_date + datetime.timedelta(days=1)
 
-            # 创建 iCalendar 事件
-            ical_content = f"""BEGIN:VCALENDAR
+            if due_time:
+                # 有具体时间：创建定时事件
+                dt_str = f"{due_date}T{due_time}:00"
+                dt = datetime.datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+
+                ical_content = f"""BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//Zectrix Sync//CN
 BEGIN:VEVENT
@@ -497,8 +501,23 @@ SUMMARY:{title}
 END:VEVENT
 END:VCALENDAR
 """
+            else:
+                # 没有时间：创建全天事件
+                ical_content = f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Zectrix Sync//CN
+BEGIN:VEVENT
+UID:{uid}
+DTSTART;VALUE=DATE:{dt_date.strftime("%Y%m%d")}
+DTEND;VALUE=DATE:{next_date.strftime("%Y%m%d")}
+SUMMARY:{title}
+END:VEVENT
+END:VCALENDAR
+"""
+
             cal.add_event(ical_content)
-            print(f"在日历创建事件成功: {title} {due_date} {due_time}")
+            time_str = f" {due_time}" if due_time else " (全天)"
+            print(f"在日历创建事件成功: {title} {due_date}{time_str}")
             return uid
         except Exception as e:
             print(f"创建日历事件失败: {e}")
