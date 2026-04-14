@@ -3,3 +3,9 @@
 __pycache__/
 .env
 .env.*
+
+# Python venv
+.venv/
+
+# Local data
+todo_mapping.json

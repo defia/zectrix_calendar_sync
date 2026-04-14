@@ -7,7 +7,8 @@ import json
 import sys
 import time
 from typing import List, Dict, Optional
-from icalendar import Calendar
+from icalendar import Calendar, Event, vDatetime, vText
+import uuid
 
 # 尝试从 .env 文件加载环境变量
 try:
@@ -31,6 +32,9 @@ CALDAV_PASS = os.getenv("CALDAV_PASS", "")  # 你的CalDAV密码/授权码
 
 CALENDAR_PREFIX = "[日历]"
 
+# 本地映射文件路径（存储待办ID与日历UID的映射）
+MAPPING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "todo_mapping.json")
+
 
 class CalendarSyncer:
     def __init__(self, dry_run=False):
@@ -41,7 +45,62 @@ class CalendarSyncer:
         }
         self.existing_todos = []
         self._uid_map: Dict[str, Dict] = {}
+        self._todo_to_uid_map: Dict[int, Dict] = {}  # todo_id -> {uid, title, due_date, due_time}
+        self._caldav_client = None
+        self._caldav_calendar = None
         self.max_retries = 3
+        self._load_mapping()
+
+    def _load_mapping(self):
+        """加载本地映射文件"""
+        try:
+            if os.path.exists(MAPPING_FILE):
+                with open(MAPPING_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # 兼容旧格式 (只存 uid 字符串) 和新格式 (存字典)
+                    loaded = data.get("todo_to_uid", {})
+                    for k, v in loaded.items():
+                        todo_id = int(k)
+                        if isinstance(v, str):
+                            # 旧格式：只有 uid
+                            self._todo_to_uid_map[todo_id] = {"uid": v}
+                        else:
+                            # 新格式：包含完整信息
+                            self._todo_to_uid_map[todo_id] = v
+        except Exception as e:
+            print(f"加载映射文件失败: {e}")
+            self._todo_to_uid_map = {}
+
+    def _save_mapping(self):
+        """保存本地映射文件"""
+        try:
+            with open(MAPPING_FILE, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "todo_to_uid": {str(k): v for k, v in self._todo_to_uid_map.items()}
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"保存映射文件失败: {e}")
+
+    def _get_caldav_calendar(self):
+        """获取 CalDAV 日历连接（懒加载）"""
+        if self._caldav_calendar is None:
+            import caldav
+            client = caldav.DAVClient(
+                url=CALDAV_URL,
+                username=CALDAV_USER,
+                password=CALDAV_PASS
+            )
+            principal = client.principal()
+            calendars = principal.calendars()
+            if calendars:
+                # 使用第一个日历，或寻找名为 "home" 的日历
+                for cal in calendars:
+                    if "home" in str(cal.url).lower():
+                        self._caldav_calendar = cal
+                        break
+                if self._caldav_calendar is None:
+                    self._caldav_calendar = calendars[0]
+        return self._caldav_calendar
 
     def retry_with_backoff(self, func, *args, **kwargs):
         """指数退避重试"""
@@ -402,10 +461,188 @@ class CalendarSyncer:
 
         print(f"同步完成，新增 {created_count}，更新 {updated_count}，删除 {cleaned_count} 个日程")
 
+    # ─────────────────────────────────────────────────────
+    # 便利贴 → 日历 同步方法
+    # ─────────────────────────────────────────────────────
+
+    def _local_todos(self):
+        """Yield 本地创建的待办（非日历同步的）"""
+        for todo in self.existing_todos:
+            if todo.get("status", 1) != 0:
+                continue
+            title = todo.get("title", "")
+            # 不是日历同步的待办
+            if not title.startswith(CALENDAR_PREFIX):
+                yield todo
+
+    def create_caldav_event(self, title: str, due_date: str, due_time: str) -> Optional[str]:
+        """在 CalDAV 日历中创建事件，返回 UID。due_time 为 None 时创建全天事件。"""
+        if self.dry_run:
+            print(f"  [DRY RUN] 会在日历创建事件: {title} {due_date} {due_time}")
+            return f"dry-run-{uuid.uuid4()}"
+
+        try:
+            cal = self._get_caldav_calendar()
+            if not cal:
+                print("无法获取 CalDAV 日历")
+                return None
+
+            # 生成唯一 UID
+            uid = f"{uuid.uuid4()}@zectrix-sync"
+
+            # 构建日期对象（用于全天事件）
+            dt_date = datetime.datetime.strptime(due_date, "%Y-%m-%d").date()
+            next_date = dt_date + datetime.timedelta(days=1)
+
+            if due_time:
+                # 有具体时间：创建定时事件
+                dt_str = f"{due_date}T{due_time}:00"
+                dt = datetime.datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+
+                ical_content = f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Zectrix Sync//CN
+BEGIN:VEVENT
+UID:{uid}
+DTSTART;TZID=Asia/Shanghai:{dt.strftime("%Y%m%dT%H%M%S")}
+DTEND;TZID=Asia/Shanghai:{(dt + datetime.timedelta(hours=1)).strftime("%Y%m%dT%H%M%S")}
+SUMMARY:{title}
+END:VEVENT
+END:VCALENDAR
+"""
+            else:
+                # 没有时间：创建全天事件
+                ical_content = f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Zectrix Sync//CN
+BEGIN:VEVENT
+UID:{uid}
+DTSTART;VALUE=DATE:{dt_date.strftime("%Y%m%d")}
+DTEND;VALUE=DATE:{next_date.strftime("%Y%m%d")}
+SUMMARY:{title}
+END:VEVENT
+END:VCALENDAR
+"""
+
+            cal.add_event(ical_content)
+            time_str = f" {due_time}" if due_time else " (全天)"
+            print(f"在日历创建事件成功: {title} {due_date}{time_str}")
+            return uid
+        except Exception as e:
+            print(f"创建日历事件失败: {e}")
+            return None
+
+    def delete_caldav_event(self, uid: str) -> bool:
+        """从 CalDAV 日历中删除事件"""
+        if self.dry_run:
+            print(f"  [DRY RUN] 会从日历删除事件: uid={uid}")
+            return True
+
+        try:
+            cal = self._get_caldav_calendar()
+            if not cal:
+                return False
+
+            # 通过 UID 查找事件
+            events = cal.events()
+            for event in events:
+                if uid in event.data:
+                    event.delete()
+                    print(f"从日历删除事件成功: uid={uid}")
+                    return True
+            print(f"未找到要删除的日历事件: uid={uid}")
+            return False
+        except Exception as e:
+            print(f"删除日历事件失败: {e}")
+            return False
+
+    def update_caldav_event(self, uid: str, title: str, due_date: str, due_time: str) -> Optional[str]:
+        """更新 CalDAV 日历中的事件（删除旧的，创建新的），返回新 UID"""
+        if self.dry_run:
+            print(f"  [DRY RUN] 会更新日历事件: {title} {due_date} {due_time}")
+            return f"dry-run-{uuid.uuid4()}"
+
+        # 先删除旧事件
+        if not self.delete_caldav_event(uid):
+            print(f"更新失败：无法删除旧事件 uid={uid}")
+            return None
+
+        # 创建新事件
+        new_uid = self.create_caldav_event(title, due_date, due_time)
+        return new_uid
+
+    def sync_local_todos_to_calendar(self):
+        """将本地待办同步到日历"""
+        created_count = 0
+        updated_count = 0
+
+        # 获取日历中所有 UID（用于检测删除）
+        cal_events = self.fetch_aliyun_calendar_events()
+        cal_uids = {e["uid"] for e in cal_events if e.get("uid")}
+
+        # 本地待办 ID 集合
+        local_todo_ids = set()
+        need_save = False
+
+        for todo in self._local_todos():
+            todo_id = todo.get("id")
+            local_todo_ids.add(todo_id)
+
+            title = todo.get("title", "")
+            due_date = todo.get("dueDate", "")
+            due_time = todo.get("dueTime", "")
+
+            # 没有截止时间的待办跳过
+            if not due_date:
+                continue
+
+            # 检查是否已经有映射
+            existing_mapping = self._todo_to_uid_map.get(todo_id)
+
+            if existing_mapping:
+                # 已有映射，检查是否需要更新
+                old_uid = existing_mapping.get("uid")
+                old_title = existing_mapping.get("title", "")
+                old_due_date = existing_mapping.get("due_date", "")
+                old_due_time = existing_mapping.get("due_time", "")
+
+                # 检查标题、日期或时间是否变化
+                if title != old_title or due_date != old_due_date or due_time != old_due_time:
+                    # 有变化，更新事件
+                    new_uid = self.update_caldav_event(old_uid, title, due_date, due_time)
+                    if new_uid:
+                        # 更新映射
+                        self._todo_to_uid_map[todo_id] = {
+                            "uid": new_uid,
+                            "title": title,
+                            "due_date": due_date,
+                            "due_time": due_time
+                        }
+                        updated_count += 1
+                        need_save = True
+            else:
+                # 没有映射，创建新事件
+                uid = self.create_caldav_event(title, due_date, due_time)
+                if uid:
+                    self._todo_to_uid_map[todo_id] = {
+                        "uid": uid,
+                        "title": title,
+                        "due_date": due_date,
+                        "due_time": due_time
+                    }
+                    created_count += 1
+                    need_save = True
+
+        # 保存映射
+        if need_save and not self.dry_run:
+            self._save_mapping()
+
+        print(f"本地待办同步到日历完成，新增 {created_count}，更新 {updated_count} 个事件")
+
     def run(self):
         """运行完整同步流程"""
         print("=" * 50)
-        print(f"开始同步日历 时间: {datetime.datetime.now()}")
+        print(f"开始双向同步 时间: {datetime.datetime.now()}")
         print("=" * 50)
 
         # 1. 获取现有待办
@@ -419,18 +656,22 @@ class CalendarSyncer:
         print("\n步骤2: 获取邮箱日程...")
         events = self.fetch_aliyun_calendar_events()
 
-        # 4. 同步新增日程
+        # 4. 日历 → 便利贴 同步
         if events:
-            print("\n步骤3: 同步新日程...")
+            print("\n步骤3: 日历 → 便利贴 同步...")
             self.sync_new_events(events)
 
+        # 5. 便利贴 → 日历 同步
+        print("\n步骤4: 便利贴 → 日历 同步...")
+        self.sync_local_todos_to_calendar()
+
         print("\n" + "=" * 50)
-        print("同步完成!")
+        print("双向同步完成!")
         print("=" * 50)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="同步邮箱日历到Zectrix待办事项")
+    parser = argparse.ArgumentParser(description="双向同步邮箱日历和Zectrix待办事项")
     parser.add_argument("--dry-run", action="store_true",
                         help="模拟运行，不实际执行写入操作")
     args = parser.parse_args()
